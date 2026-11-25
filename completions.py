@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import os
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import threading
 import time
@@ -29,39 +31,114 @@ from .iotypes import (DEVELOPER_ROLE_KEY, INSTRUCTIONS_ROLES, ParamClient, Param
 logger = get_logger(__name__)
 
 
-def comfy_image_to_base64_png_url(image: torch.Tensor) -> str:
-    # Taken from the SaveImage ComfyUI node, convert the tensor into a regular image
-    i = np.multiply(255., image.cpu().numpy())
-    img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
-    # Encode the image as PNG in base64 format
+# PNG compression level of the images sent. The PIL default (6) takes about
+# 2.6 times longer than 3 on a large photo for a file only 5% smaller: the
+# pixels are the same.
+PNG_COMPRESS_LEVEL = 3
+# Rows converted to 8 bits at once: a band of floats is a small temporary,
+# where a whole image of floats is several times the size of the image
+_BAND_ROWS = 256
+
+JPEG_QUALITY_TOOLTIP = (
+    "0: the images are sent as PNG, lossless but big (a 4096x4096 photo is about 23 MB). 1 to 100: they are sent as "
+    "JPEG at that quality, much smaller (about 1 MB for the same photo at 90) and faster to encode, but lossy. 85 to "
+    "95 suits vision models. JPEG has no transparency: an image with an alpha channel is still sent as PNG."
+)
+
+# Set once the alpha channel warning of comfy_image_to_data_url was logged
+_alpha_warned = False
+
+
+def check_jpeg_quality(value: Any, node: str) -> int:
+    """The JPEG Quality input (0: PNG) of a node, checked: a linked input can
+    receive anything, or None for a Load Memory with nothing stored (0)."""
+    check_input(value, int, "JPEG Quality", "a whole number", node)
+    if value is None:
+        return 0
+    if not 0 <= value <= 100:
+        raise ValueError(f"{node}: the JPEG Quality ({value}) must be between 0 (PNG) and 100")
+    return value
+
+
+def _tensor_to_uint8(image: torch.Tensor) -> np.ndarray:
+    """The [H,W,C] float image (0 to 1) as 8 bit values, the way the SaveImage
+    ComfyUI node does: scaled, clipped, truncated. Converted band by band so
+    that no copy of the whole image in floats is made (4 bytes per value, the
+    main memory cost of a large image)."""
+    pixels = np.empty(tuple(image.shape), np.uint8)
+    for row in range(0, image.shape[0], _BAND_ROWS):
+        band = image[row:row + _BAND_ROWS].mul(255.0).clamp_(0, 255)
+        pixels[row:row + _BAND_ROWS] = band.to(torch.uint8).cpu().numpy()
+    return pixels
+
+
+def comfy_image_to_data_url(image: torch.Tensor, jpeg_quality: int = 0) -> str:
+    """The [H,W,C] image as a base64 data URL: a lossless PNG, or a JPEG when
+    jpeg_quality (1 to 100) is set. JPEG has no alpha channel: such an image
+    stays a PNG."""
+    global _alpha_warned
+    img = Image.fromarray(_tensor_to_uint8(image))
+    as_jpeg = jpeg_quality > 0
+    if as_jpeg and img.mode != "RGB":
+        as_jpeg = False
+        if not _alpha_warned:
+            _alpha_warned = True
+            logger.warning("JPEG Quality: an image with an alpha channel (%s) is sent as PNG, JPEG has no transparency",
+                           img.mode)
     buffer = BytesIO()
-    img.save(buffer, format="PNG")
-    b64_png = base64.b64encode(buffer.getvalue())
-    # Return the formated string URL
-    return f"data:image/png;base64,{b64_png.decode('utf-8')}"
+    if as_jpeg:
+        img.save(buffer, format="JPEG", quality=jpeg_quality)
+    else:
+        img.save(buffer, format="PNG", compress_level=PNG_COMPRESS_LEVEL)
+    # getbuffer: no copy of the encoded image. The temporary base64 bytes are
+    # freed before the URL is built: only two copies of it exist at a time.
+    return f"data:image/{'jpeg' if as_jpeg else 'png'};base64," + base64.b64encode(buffer.getbuffer()).decode("ascii")
 
 
-def _encode_images(images: torch.Tensor, stop: threading.Event) -> list[str]:
-    urls: list[str] = []
-    for image in images:  # iterating a [B,H,W,C] tensor yields [H,W,C] images
-        if stop.is_set():
-            break  # the caller gave up (Cancel, prompt failure): result unused
-        urls.append(comfy_image_to_base64_png_url(image))
-    return urls
+# What encoding an image costs in memory, on top of the image itself: its 8
+# bit copy, the one of PIL, the encoded image and its base64 text, about 9
+# bytes per pixel (measured: 8.7). A batch is encoded in parallel within a
+# budget, so that many large images do not use gigabytes at once.
+_ENCODE_BYTES_PER_PIXEL = 9
+_ENCODE_MEMORY_BUDGET = 1 << 30
+_MAX_ENCODE_THREADS = 8
 
 
-async def encode_images(images: torch.Tensor) -> list[str]:
-    """The PNG data URLs of a batch of images, encoded in a worker thread: the
-    encoding of a big batch takes seconds, and on the prompt event loop it
-    would stall every other node running meanwhile (and the Cancel checks).
-    The images are only read.
+def _encode_threads(images: torch.Tensor) -> int:
+    """How many images of a [B,H,W,C] batch to encode at the same time: one
+    per CPU, within the memory budget (at least 1)."""
+    pixels = images.shape[1] * images.shape[2]
+    by_memory = _ENCODE_MEMORY_BUDGET // max(1, pixels * _ENCODE_BYTES_PER_PIXEL)
+    return max(1, min(images.shape[0], os.cpu_count() or 1, _MAX_ENCODE_THREADS, by_memory))
+
+
+def _encode_images(images: torch.Tensor, jpeg_quality: int, stop: threading.Event) -> list[str]:
+    def encode(image: torch.Tensor) -> str:
+        # An image starting after the caller gave up (Cancel, prompt failure)
+        # is skipped: the result is unused
+        return "" if stop.is_set() else comfy_image_to_data_url(image, jpeg_quality)
+
+    threads = _encode_threads(images)
+    if threads == 1:
+        return [encode(image) for image in images]  # iterating a [B,H,W,C] tensor yields [H,W,C] images
+    # The compression (zlib, libjpeg) releases the GIL: the threads really run in parallel
+    with ThreadPoolExecutor(threads, thread_name_prefix="openai-api-encode") as pool:
+        return list(pool.map(encode, images))
+
+
+async def encode_images(images: torch.Tensor, jpeg_quality: int = 0) -> list[str]:
+    """The data URLs (PNG, or JPEG with a jpeg_quality from 1 to 100) of a
+    batch of images, in order. Encoded in worker threads: the encoding of a big
+    batch takes seconds, and on the prompt event loop it would stall every
+    other node running meanwhile (and the Cancel checks). The images are only
+    read.
 
     Stops at Cancel like a request (see run_interruptible). A running thread
-    can not be cancelled: the stop event ends it after the current image, so
+    can not be cancelled: the stop event ends it after the current images, so
     that a Cancel does not wait for the whole batch to end the prompt."""
     stop = threading.Event()
     try:
-        return await run_interruptible(asyncio.to_thread(_encode_images, images, stop))
+        return await run_interruptible(asyncio.to_thread(_encode_images, images, jpeg_quality, stop))
     finally:
         stop.set()
 
@@ -503,6 +580,20 @@ class ChatCompletion(io.ComfyNode):
                     advanced=True,
                     tooltip="Print the reasoning of the answer in the ComfyUI console (and the number of its encrypted blocks, never their content). Off by default: a long reasoning floods the console. The History output keeps it either way. Changing it sends a new request, as for any other widget: enable it before running.",
                 ),
+                # Last: the UI format of the saved workflows stores the widget
+                # values by position, and optional: the API format prompts
+                # saved before this input existed have no value for it
+                io.Int.Input(
+                    id="jpeg_quality",
+                    display_name="JPEG Quality",
+                    optional=True,
+                    advanced=True,
+                    tooltip=JPEG_QUALITY_TOOLTIP,
+                    default=0,
+                    min=0,
+                    max=100,
+                    display_mode=io.NumberDisplay.number,
+                ),
             ],
             outputs=[
                 io.String.Output(
@@ -549,6 +640,7 @@ class ChatCompletion(io.ComfyNode):
                       force_regen: bool = False,
                       send_back_reasoning: bool | None = True,
                       show_reasoning: bool | None = False,
+                      jpeg_quality: int | None = 0,
                 ) -> io.NodeOutput:
         # Linked inputs are not checked by validate_inputs (None there)
         if not isinstance(prompt, str) or prompt == "":
@@ -566,6 +658,7 @@ class ChatCompletion(io.ComfyNode):
         check_input(send_back_reasoning, bool, "Send Back Reasoning", "a boolean", "Chat Completion")
         check_input(show_reasoning, bool, "Show Reasoning", "a boolean", "Chat Completion")
         check_input(images, torch.Tensor, "Image(s)", "images", "Chat Completion")
+        jpeg_quality = check_jpeg_quality(jpeg_quality, "Chat Completion")
         request_options = _split_options(options)
         # Never send both token limits at once. Checked before encoding the
         # images, which can take a while.
@@ -575,7 +668,7 @@ class ChatCompletion(io.ComfyNode):
                 "Use only one: max_tokens for older models and providers, "
                 "or max_completion_tokens for newer OpenAI chat models."
             )
-        image_urls = await encode_images(images) if images is not None else None
+        image_urls = await encode_images(images, jpeg_quality) if images is not None else None
         messages = _build_messages(history, system_prompt, request_options)
         messages.append(user_message(prompt, image_urls))
         request_kwargs: dict[str, Any] = {

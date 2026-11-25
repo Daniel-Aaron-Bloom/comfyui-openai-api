@@ -97,6 +97,7 @@ A server with its own certificate (a self-signed one, or one from a private CA) 
 | `Image(s)` | | Optional: an image or a batch of images, sent before the prompt. Use a vision capable model |
 | `Send Back Reasoning` (advanced) | on | Sends the reasoning kept in the history back to the server (see [Reasoning models](#reasoning-models)) |
 | `Show Reasoning` (advanced) | off | Prints the reasoning in the console |
+| `JPEG Quality` (advanced) | 0 | `0` sends the images as PNG (lossless). `1` to `100` sends them as JPEG at that quality (see [Large images](#chat-completion)) |
 
 | Output | Description |
 |---|---|
@@ -110,7 +111,8 @@ A server with its own certificate (a self-signed one, or one from a private CA) 
 - **Empty answers**: if the server returns no text (e.g. a reasoning model that used its whole token budget), the response is an empty string and a warning with the `finish_reason` is logged; when a reasoning came back, the warning suggests raising the max tokens. A refusal, or a response without any choice or message, raises an error.
 - **Cancel**: the ComfyUI `Cancel` button (or `POST /interrupt`) stops a running request at once, instead of waiting for the answer or the client timeout. It also stops the encoding of the input images.
 - **Parallel requests**: Chat Completion nodes that do not depend on each other send their requests at the same time, so the run takes as long as the slowest one instead of the sum. The server must handle concurrent requests for this to help (most local servers queue or batch them, depending on their settings).
-- **No blocking**: the images are encoded outside ComfyUI's event loop, so other nodes keep running meanwhile.
+- **No blocking**: the images are encoded outside ComfyUI's event loop, so other nodes keep running meanwhile. A batch is encoded in parallel threads, within a memory budget so that many large images do not use gigabytes at once.
+- **Large images**: a 4096x4096 photo is about 23 MB as a PNG (82 MB at 8192x8192, base64 text included) and takes about 0.5 s (1.8 s) to encode. The images kept in the history are sent again with every request, servers, proxies and providers limit the size of a request or an image, and many vision models resize large images anyway: sending them big can be slow or refused. `JPEG Quality` sends JPEGs instead: the same photos are about 1.2 MB (7 MB) and take 40 ms (170 ms), at the cost of a lossy image without transparency (an image with an alpha channel stays a PNG). This is for photos: flat graphics and screenshots are often smaller as PNG. 85 to 95 suits vision models; above that the size grows fast for little gain (a quality of 99 is about 6 times bigger than 90). These figures come from one photo on a fast machine: they vary with the content and the CPU.
 
 ### Options
 
@@ -145,9 +147,10 @@ Adds a message to a conversation history without calling any server: start a new
 | Input | Default | Description |
 |---|---|---|
 | `History` | | Optional: the history to add the message to. Without it, a new history holding only this message |
-| `Role` | `system` | `system`, `developer`, `user` or `assistant`. Picking `user` shows the `images` input, `assistant` the `reasoning` ones |
+| `Role` | `system` | `system`, `developer`, `user` or `assistant`. Picking `user` shows the `images` and `jpeg_quality` inputs, `assistant` the `reasoning` ones |
 | `Text` | | The message text, required |
 | `images` (`user` role only) | | Optional: an image or a batch of images, sent before the text |
+| `jpeg_quality` (advanced, `user` role only) | 0 | As the `JPEG Quality` of Chat Completion: `0` sends the images as PNG, `1` to `100` as JPEG |
 | `reasoning` (`assistant` role only) | | Optional: the reasoning of the answer, kept in a field of the message (see `reasoning_field`) |
 | `reasoning_field` (advanced, `assistant` role only) | `reasoning_content` | The field holding the reasoning: `reasoning_content` or `reasoning`, as the server names it |
 
@@ -155,11 +158,11 @@ Adds a message to a conversation history without calling any server: start a new
 |---|---|
 | `History` | The history received, plus the new message |
 
-The inputs that depend on the role (`images`, `reasoning`, `reasoning_field`) are shown under their name by ComfyUI, not under a display name.
+The inputs that depend on the role (`images`, `jpeg_quality`, `reasoning`, `reasoning_field`) are shown under their name by ComfyUI, not under a display name.
 
 - **Example**: Build History (`user`: "Translate to French: cat") -> Build History (`assistant`: "chat") -> Chat Completion (`History` input, `Prompt`: "Translate to French: dog"). The model sees the first exchange as the way to answer.
 - **Where the message goes**: at the end of the history, except a `system` or `developer` message, which becomes the **first** message and replaces the existing system/developer one, if any. A non empty `System Prompt` on the Chat Completion still replaces it (see [System prompt and history](#chat-completion)).
-- **Images** are for `user` messages: the `images` input only exists while the role is `user`: picking another role removes it with its link, and the link is not restored when coming back to `user`. They are encoded like the ones of Chat Completion (PNG) and need a vision capable model. Trim History counts them in its `Max Images`.
+- **Images** are for `user` messages: the `images` input only exists while the role is `user`: picking another role removes it with its link, and the link is not restored when coming back to `user`. They are encoded like the ones of Chat Completion (PNG, or JPEG with `jpeg_quality`, see [Large images](#chat-completion)) and need a vision capable model. Trim History counts them in its `Max Images`.
 - **Reasoning** is for `assistant` messages, to rebuild the reasoning a model returned with its answer. Left empty, the message has no reasoning field. Pick the `reasoning_field` of your server (see [Reasoning models](#reasoning-models)): `reasoning_content` for llama.cpp, SGLang, LM Studio, tabbyAPI, DeepSeek... or `reasoning` for recent vLLM, Ollama, OpenRouter, Groq... A server may reject the field of another one. Chat Completion treats it like the reasoning of its own answers: `Send Back Reasoning` decides if it is sent to the server, and if the server rejects it, turn that off.
 - **End with an answer**: a Chat Completion adds its own user message after the history, and servers expect the roles to alternate. End the built history with an `assistant` message (or only a system one).
 

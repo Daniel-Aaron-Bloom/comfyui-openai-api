@@ -5,7 +5,8 @@ from openai.types.chat.chat_completion_message_param import ChatCompletionMessag
 
 from comfy_api.latest import io
 
-from .completions import REASONING_KEYS, encode_images, instructions_message, user_message
+from .completions import (JPEG_QUALITY_TOOLTIP, REASONING_KEYS, check_jpeg_quality, encode_images,
+                          instructions_message, user_message)
 from .logs import get_logger
 from .iotypes import INSTRUCTIONS_ROLES, ParamHistory, HistoryPayload, check_history, check_input
 
@@ -53,7 +54,7 @@ IMAGE_REMOVED_TEXT = "[image removed]"
 
 
 def _is_image_part(part: Any) -> bool:
-    # Chat Completion sends its images as image_url parts (PNG data URLs)
+    # Chat Completion sends its images as image_url parts (PNG or JPEG data URLs)
     return isinstance(part, dict) and part.get("type") == "image_url"
 
 
@@ -340,6 +341,17 @@ class BuildHistory(io.ComfyNode):
                 optional=True,
                 tooltip="Image(s) to include in the message, sent before its text. A vision capable model is needed to read them.",
             ),
+            io.Int.Input(
+                id="jpeg_quality",
+                display_name="JPEG Quality",
+                optional=True,
+                advanced=True,
+                tooltip=JPEG_QUALITY_TOOLTIP,
+                default=0,
+                min=0,
+                max=100,
+                display_mode=io.NumberDisplay.number,
+            ),
         ]
         assistant_inputs = [
             io.String.Input(
@@ -413,6 +425,7 @@ class BuildHistory(io.ComfyNode):
         # plain text for an option that does not exist (an edited prompt).
         selected = role if isinstance(role, dict) else {"role": role}
         role_name, images, reasoning = selected.get("role"), selected.get("images"), selected.get("reasoning")
+        jpeg_quality = selected.get("jpeg_quality")
         # None: not sent by a prompt written before this input existed, or by a hand made one
         reasoning_field = selected.get("reasoning_field") or REASONING_KEY
         if reasoning_field not in REASONING_KEYS:
@@ -427,8 +440,9 @@ class BuildHistory(io.ComfyNode):
         check_history(history, "Build History")
         check_input(images, torch.Tensor, "Image(s)", "images", "Build History")
         check_input(reasoning, str, "Reasoning", "a text", "Build History")
+        jpeg_quality = check_jpeg_quality(jpeg_quality, "Build History")
         # Encoded after the checks: it can take a while
-        image_urls = await encode_images(images) if images is not None else None
+        image_urls = await encode_images(images, jpeg_quality) if images is not None else None
         # A new list: the history received is shared with the (cached) upstream node output
         messages = history.get_msgs_copy() if history is not None else []
         return io.NodeOutput(HistoryPayload(add_message(messages, role_name, text, image_urls, reasoning, reasoning_field)))
