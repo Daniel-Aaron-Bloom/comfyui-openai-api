@@ -40,6 +40,33 @@ class _MemoryStore:
         with self._lock:
             return self._versions.get(key, 0)
 
+    def peek(self, key: str) -> tuple[Any, int]:
+        """The value stored under key (None if there is none) and its version,
+        read together. The value is the stored one, not a copy: read only."""
+        with self._lock:
+            return self._values.get(key), self._versions.get(key, 0)
+
+    def entries(self) -> list[tuple[str, Any, int]]:
+        """The key, value and version of every key holding a value (a stored
+        None counts as nothing), sorted by key. The values are the stored
+        ones, not copies: read only."""
+        with self._lock:
+            found = [(key, value, self._versions.get(key, 0))
+                     for key, value in self._values.items() if value is not None]
+        return sorted(found, key=lambda entry: entry[0])
+
+    def save_if_version(self, key: str, value: Any, version: int) -> bool:
+        """Like save, but only if the key was neither saved nor wiped since
+        the version returned by peek: False (nothing stored) otherwise, so an
+        edit made on an old value never overwrites a newer one."""
+        stored = copy.deepcopy(value)
+        with self._lock:
+            if self._versions.get(key, 0) != version:
+                return False
+            self._values[key] = stored
+            self._versions[key] = version + 1
+            return True
+
 
 MEMORY = _MemoryStore()
 

@@ -181,6 +181,16 @@ Carry a value from one queued run to the next: an answer, an image analysis, a w
 - **Save Memory always runs**, on every queued prompt, even with nothing connected downstream.
 - **RAM only**: the memory is a helper, not a database. It is shared by every prompt and workflow using the same key, and lost when ComfyUI restarts.
 
+#### Memory panel
+
+The **Memory** tab of the ComfyUI sidebar (the database icon) lists what the Save Memory nodes stored, and lets you **view, edit and save back** a conversation history or a text, without touching the workflow: fix a wrong answer, delete a turn, rewrite the system message or a saved analysis... The next run of a Load Memory node on that key gets what you saved.
+
+- **A history** is one card per message: change its role, edit its text, move it, delete it, or insert a message between two others (the `+` lines). Images are shown and can be removed, not added. The reasoning of the answers is in a closed *Reasoning* section of the message, and any other field the message holds in a closed *Other fields* one.
+- **A text** is edited as is. Any other value (an image, a number...) is listed but can not be edited.
+- **Nothing changes until you click Save.** *Revert* drops your edits, and they are kept if you close the tab or open another one.
+- **Runs and edits never overwrite each other silently**: when a run saves the key you are editing, the panel tells you and offers *Reload* (drops your edits) or *Save anyway*. A save made on an outdated value is refused.
+- **Open to whoever opens ComfyUI**: anyone who can reach it can read and edit the memory this way, as they can already run the workflows that load it.
+
 ### Unload Model
 
 Asks a local inference server to unload its model, e.g. to free VRAM before an image generation. It passes its `Value` input through unchanged, once the unload is done.
