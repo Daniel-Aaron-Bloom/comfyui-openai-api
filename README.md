@@ -145,7 +145,7 @@ Adds a message to a conversation history without calling any server: start a new
 | Input | Default | Description |
 |---|---|---|
 | `History` | | Optional: the history to add the message to. Without it, a new history holding only this message |
-| `Role` | `user` | `user`, `assistant`, `system` or `developer`. Picking `user` shows the `Image(s)` input |
+| `Role` | `system` | `system`, `developer`, `user` or `assistant`. Picking `user` shows the `Image(s)` input |
 | `Text` | | The message text, required |
 | `Image(s)` (`user` role only) | | Optional: an image or a batch of images, sent before the text |
 
@@ -155,7 +155,7 @@ Adds a message to a conversation history without calling any server: start a new
 
 - **Example**: Build History (`user`: "Translate to French: cat") -> Build History (`assistant`: "chat") -> Chat Completion (`History` input, `Prompt`: "Translate to French: dog"). The model sees the first exchange as the way to answer.
 - **Where the message goes**: at the end of the history, except a `system` or `developer` message, which becomes the **first** message and replaces the existing system/developer one, if any. A non empty `System Prompt` on the Chat Completion still replaces it (see [System prompt and history](#chat-completion)).
-- **Images** are for `user` messages: the `Image(s)` input is only shown while the role is `user`, and an image left connected to it is ignored once another role is picked. They are encoded like the ones of Chat Completion (PNG) and need a vision capable model. Trim History counts them in its `Max Images`.
+- **Images** are for `user` messages: the `Image(s)` input only exists while the role is `user`: picking another role removes it with its link, and the link is not restored when coming back to `user`. They are encoded like the ones of Chat Completion (PNG) and need a vision capable model. Trim History counts them in its `Max Images`.
 - **End with an answer**: a Chat Completion adds its own user message after the history, and servers expect the roles to alternate. End the built history with an `assistant` message (or only a system one).
 
 ### Trim History

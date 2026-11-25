@@ -297,8 +297,12 @@ class TrimHistory(io.ComfyNode):
                                                          keep_turns, keep_images)))
 
 
-# Roles of the messages Build History adds
-BUILD_ROLES = ("user", "assistant", *INSTRUCTIONS_ROLES)
+# Roles of the messages Build History adds, in the order of the Role dropdown.
+# The first one is selected when the node is created, and the ComfyUI frontend
+# fails to create a node whose first dynamic combo option only holds sockets
+# (no widget), like the images of the user role: keep an option without
+# inputs first.
+BUILD_ROLES = (*INSTRUCTIONS_ROLES, "user", "assistant")
 
 
 def add_message(messages: list[ChatCompletionMessageParam], role: str, text: str,
