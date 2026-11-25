@@ -145,9 +145,11 @@ Adds a message to a conversation history without calling any server: start a new
 | Input | Default | Description |
 |---|---|---|
 | `History` | | Optional: the history to add the message to. Without it, a new history holding only this message |
-| `Role` | `system` | `system`, `developer`, `user` or `assistant`. Picking `user` shows the `Image(s)` input |
+| `Role` | `system` | `system`, `developer`, `user` or `assistant`. Picking `user` shows the `Image(s)` input, `assistant` the `Reasoning` ones |
 | `Text` | | The message text, required |
 | `Image(s)` (`user` role only) | | Optional: an image or a batch of images, sent before the text |
+| `Reasoning` (`assistant` role only) | | Optional: the reasoning of the answer, kept in a field of the message (see `Reasoning Field`) |
+| `Reasoning Field` (advanced, `assistant` role only) | `reasoning_content` | The field holding the reasoning: `reasoning_content` or `reasoning`, as the server names it |
 
 | Output | Description |
 |---|---|
@@ -156,6 +158,7 @@ Adds a message to a conversation history without calling any server: start a new
 - **Example**: Build History (`user`: "Translate to French: cat") -> Build History (`assistant`: "chat") -> Chat Completion (`History` input, `Prompt`: "Translate to French: dog"). The model sees the first exchange as the way to answer.
 - **Where the message goes**: at the end of the history, except a `system` or `developer` message, which becomes the **first** message and replaces the existing system/developer one, if any. A non empty `System Prompt` on the Chat Completion still replaces it (see [System prompt and history](#chat-completion)).
 - **Images** are for `user` messages: the `Image(s)` input only exists while the role is `user`: picking another role removes it with its link, and the link is not restored when coming back to `user`. They are encoded like the ones of Chat Completion (PNG) and need a vision capable model. Trim History counts them in its `Max Images`.
+- **Reasoning** is for `assistant` messages, to rebuild the reasoning a model returned with its answer. Left empty, the message has no reasoning field. Pick the `Reasoning Field` of your server (see [Reasoning models](#reasoning-models)): `reasoning_content` for llama.cpp, SGLang, LM Studio, tabbyAPI, DeepSeek... or `reasoning` for recent vLLM, Ollama, OpenRouter, Groq... A server may reject the field of another one. Chat Completion treats it like the reasoning of its own answers: `Send Back Reasoning` decides if it is sent to the server, and if the server rejects it, turn that off.
 - **End with an answer**: a Chat Completion adds its own user message after the history, and servers expect the roles to alternate. End the built history with an `assistant` message (or only a system one).
 
 ### Trim History
@@ -286,6 +289,7 @@ ComfyUI only runs the nodes that an output node needs. Behind the core `If/Else 
 Reasoning (thinking) models return their reasoning next to the answer: in a `reasoning_content` field (llama.cpp, SGLang, LM Studio, tabbyAPI, DeepSeek...), a `reasoning` one (recent vLLM, Ollama, OpenRouter, Groq...), or as thinking parts of the content (Mistral).
 
 - **Kept in the `History` output**, as received. With `Send Back Reasoning` (advanced, on by default), the next Chat Completions send it back to the server as is; turn it off to send the history without it. Whether the model reuses it is up to the server and its chat template: some keep the past reasoning only with a chat template option (e.g. `preserve_thinking`, set with [Extra Body](#options)).
+- **Written by hand**: [Build History](#build-history) can give an assistant message its reasoning, in the `reasoning_content` or `reasoning` field.
 - **When to turn Send Back Reasoning off**: if the context grows too much, or if the server rejects the reasoning of the previous answers (some cloud providers answer HTTP 400 or 422 on the second turn).
 - **`Show Reasoning`** (advanced, off by default, as a long reasoning floods the console) prints it in the console.
 - **Relays** (services forwarding the requests to other providers, like OpenRouter or the Vercel AI Gateway) also return `reasoning_details` blocks: text, summary and encrypted. They are kept unmodified and in order. The content of the encrypted blocks is never shown, only their count and size.

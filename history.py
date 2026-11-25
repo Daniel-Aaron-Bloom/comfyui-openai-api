@@ -1,11 +1,11 @@
-from typing import Any
+from typing import Any, cast
 
 import torch
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 
 from comfy_api.latest import io
 
-from .completions import encode_images, instructions_message, user_message
+from .completions import REASONING_KEYS, encode_images, instructions_message, user_message
 from .logs import get_logger
 from .iotypes import INSTRUCTIONS_ROLES, ParamHistory, HistoryPayload, check_history, check_input
 
@@ -303,21 +303,31 @@ class TrimHistory(io.ComfyNode):
 # (no widget), like the images of the user role: keep an option without
 # inputs first.
 BUILD_ROLES = (*INSTRUCTIONS_ROLES, "user", "assistant")
+# The fields an assistant message can hold its reasoning in (see
+# REASONING_KEYS), reasoning_content by default
+REASONING_KEY = REASONING_KEYS[0]
 
 
 def add_message(messages: list[ChatCompletionMessageParam], role: str, text: str,
-                image_urls: list[str] | None = None) -> list[ChatCompletionMessageParam]:
+                image_urls: list[str] | None = None, reasoning: str | None = None,
+                reasoning_key: str = REASONING_KEY) -> list[ChatCompletionMessageParam]:
     """The messages with a new one added: at the end, except a system/developer
     one that becomes the first message, replacing the existing system/developer
     one if any (like the System Prompt of Chat Completion). The user messages
     are built like the ones of Chat Completion, with the images (PNG data URLs)
-    before the text. Returns a new list, the input messages are not modified."""
+    before the text, and the assistant ones with their reasoning, if any, in
+    the reasoning_key field. Returns a new list, the input messages are not
+    modified."""
     if role in INSTRUCTIONS_ROLES:
         has_instructions = bool(messages) and messages[0].get("role") in INSTRUCTIONS_ROLES
         return [instructions_message(text, role == "developer"), *(messages[1:] if has_instructions else messages)]
     if role == "user":
         return [*messages, user_message(text, image_urls)]
-    return [*messages, {"role": "assistant", "content": text}]
+    # The reasoning field only when there is a reasoning: an empty one sent
+    # back can be rejected (see extract_reasoning). Extra key, not declared by
+    # the SDK message types.
+    reasoning_fields = {reasoning_key: reasoning} if reasoning else {}
+    return [*messages, cast(ChatCompletionMessageParam, {"role": "assistant", "content": text, **reasoning_fields})]
 
 
 class BuildHistory(io.ComfyNode):
@@ -331,11 +341,33 @@ class BuildHistory(io.ComfyNode):
                 tooltip="Image(s) to include in the message, sent before its text. A vision capable model is needed to read them.",
             ),
         ]
+        assistant_inputs = [
+            io.String.Input(
+                id="reasoning",
+                display_name="Reasoning",
+                optional=True,
+                tooltip="The reasoning of the answer, kept in the message like the servers that return it do. Chat Completion sends it back like the reasoning of its own answers: see its Send Back Reasoning input. Empty: no reasoning field.",
+                multiline=True,
+                placeholder="reasoning is optional",
+            ),
+            io.Combo.Input(
+                id="reasoning_field",
+                display_name="Reasoning Field",
+                optional=True,
+                advanced=True,
+                options=list(REASONING_KEYS),
+                default=REASONING_KEY,
+                tooltip="The field of the message holding the reasoning, the one the server uses: reasoning_content (llama.cpp, SGLang, LM Studio, tabbyAPI, DeepSeek...) or reasoning (recent vLLM, Ollama, OpenRouter, Groq...). A server may reject the field of another one.",
+            ),
+        ]
+        # The inputs of each role: none for the instructions ones (the first option
+        # has none, see BUILD_ROLES)
+        role_inputs = {"user": user_inputs, "assistant": assistant_inputs}
         return io.Schema(
             node_id="OAIAPI_BuildHistory",
             display_name="OpenAI API - Build History",
             category="OpenAI API",
-            description="Adds a message to a conversation history, without calling any server: start a new history or add to the one received, and chain several of these nodes to write the whole conversation (e.g. examples for the model to follow). A user message can hold images. A system or developer message becomes the first message of the history, replacing the existing one.",
+            description="Adds a message to a conversation history, without calling any server: start a new history or add to the one received, and chain several of these nodes to write the whole conversation (e.g. examples for the model to follow). A user message can hold images, an assistant one its reasoning. A system or developer message becomes the first message of the history, replacing the existing one.",
             inputs=[
                 ParamHistory.Input(
                     id="history",
@@ -343,12 +375,12 @@ class BuildHistory(io.ComfyNode):
                     optional=True,
                     tooltip="The history to add the message to. Nothing (None): a new history with only this message.",
                 ),
-                # A dynamic combo: the Image(s) input only exists with the user role
+                # A dynamic combo: the Image(s) input only exists with the user role, the Reasoning one with the assistant role
                 io.DynamicCombo.Input(
                     id="role",
                     display_name="Role",
                     tooltip="Who says the message. A system or developer message becomes the first message of the history, replacing the existing one. A Chat Completion adds its own user message after the history: end the history with an assistant message (or a system one) so that the roles alternate.",
-                    options=[io.DynamicCombo.Option(role, user_inputs if role == "user" else []) for role in BUILD_ROLES],
+                    options=[io.DynamicCombo.Option(role, role_inputs.get(role, [])) for role in BUILD_ROLES],
                 ),
                 io.String.Input(
                     id="text",
@@ -376,10 +408,16 @@ class BuildHistory(io.ComfyNode):
 
     @classmethod
     async def execute(cls, role: dict[str, Any], text: str, history: HistoryPayload | None = None) -> io.NodeOutput:
-        # The selected option and its inputs (only the user one has some: the
-        # images). ComfyUI leaves the plain text for an option that does not
-        # exist (an edited prompt).
-        role_name, images = (role.get("role"), role.get("images")) if isinstance(role, dict) else (role, None)
+        # The selected option and its inputs (the images of the user role, the
+        # reasoning and its field of the assistant one). ComfyUI leaves the
+        # plain text for an option that does not exist (an edited prompt).
+        selected = role if isinstance(role, dict) else {"role": role}
+        role_name, images, reasoning = selected.get("role"), selected.get("images"), selected.get("reasoning")
+        # None: not sent by a prompt written before this input existed, or by a hand made one
+        reasoning_field = selected.get("reasoning_field") or REASONING_KEY
+        if reasoning_field not in REASONING_KEYS:
+            raise ValueError(
+                f"Build History: the reasoning field must be one of {', '.join(REASONING_KEYS)}, not {reasoning_field!r}")
         if role_name not in BUILD_ROLES:
             raise ValueError(f"Build History: the role must be one of {', '.join(BUILD_ROLES)}, not {role_name!r}")
         if not isinstance(text, str) or text == "":
@@ -388,8 +426,9 @@ class BuildHistory(io.ComfyNode):
                 "Load Memory node, connect its Default input for the first run.")
         check_history(history, "Build History")
         check_input(images, torch.Tensor, "Image(s)", "images", "Build History")
+        check_input(reasoning, str, "Reasoning", "a text", "Build History")
         # Encoded after the checks: it can take a while
         image_urls = await encode_images(images) if images is not None else None
         # A new list: the history received is shared with the (cached) upstream node output
         messages = history.get_msgs_copy() if history is not None else []
-        return io.NodeOutput(HistoryPayload(add_message(messages, role_name, text, image_urls)))
+        return io.NodeOutput(HistoryPayload(add_message(messages, role_name, text, image_urls, reasoning, reasoning_field)))
