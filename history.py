@@ -1,9 +1,11 @@
 from typing import Any
 
+import torch
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
 
 from comfy_api.latest import io
 
+from .completions import encode_images, instructions_message, user_message
 from .logs import get_logger
 from .iotypes import INSTRUCTIONS_ROLES, ParamHistory, HistoryPayload, check_history, check_input
 
@@ -293,3 +295,97 @@ class TrimHistory(io.ComfyNode):
         # trim_history returns a new list and never modifies its input
         return io.NodeOutput(HistoryPayload(trim_history(history.history or [], max_turns, max_images,
                                                          keep_turns, keep_images)))
+
+
+# Roles of the messages Build History adds
+BUILD_ROLES = ("user", "assistant", *INSTRUCTIONS_ROLES)
+
+
+def add_message(messages: list[ChatCompletionMessageParam], role: str, text: str,
+                image_urls: list[str] | None = None) -> list[ChatCompletionMessageParam]:
+    """The messages with a new one added: at the end, except a system/developer
+    one that becomes the first message, replacing the existing system/developer
+    one if any (like the System Prompt of Chat Completion). The user messages
+    are built like the ones of Chat Completion, with the images (PNG data URLs)
+    before the text. Returns a new list, the input messages are not modified."""
+    if role in INSTRUCTIONS_ROLES:
+        has_instructions = bool(messages) and messages[0].get("role") in INSTRUCTIONS_ROLES
+        return [instructions_message(text, role == "developer"), *(messages[1:] if has_instructions else messages)]
+    if role == "user":
+        return [*messages, user_message(text, image_urls)]
+    return [*messages, {"role": "assistant", "content": text}]
+
+
+class BuildHistory(io.ComfyNode):
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        user_inputs = [
+            io.Image.Input(
+                id="images",
+                display_name="Image(s)",
+                optional=True,
+                tooltip="Image(s) to include in the message, sent before its text. A vision capable model is needed to read them.",
+            ),
+        ]
+        return io.Schema(
+            node_id="OAIAPI_BuildHistory",
+            display_name="OpenAI API - Build History",
+            category="OpenAI API",
+            description="Adds a message to a conversation history, without calling any server: start a new history or add to the one received, and chain several of these nodes to write the whole conversation (e.g. examples for the model to follow). A user message can hold images. A system or developer message becomes the first message of the history, replacing the existing one.",
+            inputs=[
+                ParamHistory.Input(
+                    id="history",
+                    display_name="History",
+                    optional=True,
+                    tooltip="The history to add the message to. Nothing (None): a new history with only this message.",
+                ),
+                # A dynamic combo: the Image(s) input only exists with the user role
+                io.DynamicCombo.Input(
+                    id="role",
+                    display_name="Role",
+                    tooltip="Who says the message. A system or developer message becomes the first message of the history, replacing the existing one. A Chat Completion adds its own user message after the history: end the history with an assistant message (or a system one) so that the roles alternate.",
+                    options=[io.DynamicCombo.Option(role, user_inputs if role == "user" else []) for role in BUILD_ROLES],
+                ),
+                io.String.Input(
+                    id="text",
+                    display_name="Text",
+                    tooltip="The text of the message",
+                    multiline=True,
+                    placeholder="message text is mandatory",
+                ),
+            ],
+            outputs=[
+                ParamHistory.Output(
+                    id="built_history",
+                    display_name="History",
+                    tooltip="The history with the new message added",
+                ),
+            ],
+        )
+
+    @classmethod
+    def validate_inputs(cls, text: str | None) -> bool | str:
+        # None when coming from another node: checked at execution
+        if text == "":
+            return "text must be specified"
+        return True
+
+    @classmethod
+    async def execute(cls, role: dict[str, Any], text: str, history: HistoryPayload | None = None) -> io.NodeOutput:
+        # The selected option and its inputs (only the user one has some: the
+        # images). ComfyUI leaves the plain text for an option that does not
+        # exist (an edited prompt).
+        role_name, images = (role.get("role"), role.get("images")) if isinstance(role, dict) else (role, None)
+        if role_name not in BUILD_ROLES:
+            raise ValueError(f"Build History: the role must be one of {', '.join(BUILD_ROLES)}, not {role_name!r}")
+        if not isinstance(text, str) or text == "":
+            raise ValueError(
+                "Build History: the text is empty (or not a text). If it comes from a "
+                "Load Memory node, connect its Default input for the first run.")
+        check_history(history, "Build History")
+        check_input(images, torch.Tensor, "Image(s)", "images", "Build History")
+        # Encoded after the checks: it can take a while
+        image_urls = await encode_images(images) if images is not None else None
+        # A new list: the history received is shared with the (cached) upstream node output
+        messages = history.get_msgs_copy() if history is not None else []
+        return io.NodeOutput(HistoryPayload(add_message(messages, role_name, text, image_urls)))

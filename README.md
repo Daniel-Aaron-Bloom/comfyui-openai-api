@@ -6,7 +6,7 @@ ComfyUI nodes to use language models and vision language models in your workflow
 
 - **Any OpenAI compatible server**: local ones (llama.cpp, vLLM, SGLang, Ollama, LM Studio, tabbyAPI, Unsloth Studio...) or cloud providers (OpenAI, OpenRouter...).
 - **Text and images**: send a batch of images along with the prompt to a vision model.
-- **Conversations**: chain the history from node to node, or carry it across queued runs with the memory nodes to build [looping workflows](#looping-workflows).
+- **Conversations**: chain the history from node to node, [write one by hand](#build-history) (examples for the model to follow, images included), or carry it across queued runs with the memory nodes to build [looping workflows](#looping-workflows).
 - **Reasoning (thinking) models**: their reasoning is kept in the history and, optionally, sent back to the server on the next turns, for models that reuse their past thinking. It can also be printed in the console.
 - **Responsive**: the ComfyUI `Cancel` button stops a running request at once instead of waiting for the full answer, and independent requests run in parallel.
 - **Local servers friendly**: [unload the model](#unload-model) to free VRAM before an image generation, keep long conversations [bounded](#trim-history), see the [prompt cache](#prompt-cache-and-usage-stats) usage.
@@ -49,6 +49,7 @@ Every node name starts with `OpenAI API - `, and they are all in the `OpenAI API
 | [Client](#client) | The connection to the server, shared by the other nodes |
 | [Chat Completion](#chat-completion) | Sends a prompt (and images, and a history), returns the answer and the updated history |
 | [Options](#options) | Request parameters (temperature, max tokens, seed...) chained into the Chat Completion |
+| [Build History](#build-history) | Adds a message (and images, for a user one) to a history, without calling a server |
 | [Trim History](#trim-history) | Keeps a history within a number of turns and images |
 | [Save Memory / Load Memory](#save-memory--load-memory) | Carry any value from one queued run to the next |
 | [Unload Model](#unload-model) | Asks a local server to unload its model, e.g. to free VRAM |
@@ -91,7 +92,7 @@ A server with its own certificate (a self-signed one, or one from a private CA) 
 | `Force Regen` | off | Sends a new request on every run (see below) |
 | `Prompt` | | The user message, required |
 | `System Prompt` | empty | Optional instructions, sent as the first `system` message (or `developer`, see [Options](#options)) |
-| `History` | | Optional: the previous conversation, from the `History` output of another Chat Completion or from [Load Memory](#save-memory--load-memory) |
+| `History` | | Optional: the previous conversation, from the `History` output of another Chat Completion, from [Build History](#build-history) or from [Load Memory](#save-memory--load-memory) |
 | `Options` | | Optional: request parameters, from the [option nodes](#options) |
 | `Image(s)` | | Optional: an image or a batch of images, sent before the prompt. Use a vision capable model |
 | `Send Back Reasoning` (advanced) | on | Sends the reasoning kept in the history back to the server (see [Reasoning models](#reasoning-models)) |
@@ -136,6 +137,26 @@ Chain option nodes (each one has an `Options` input and output) and connect the 
 - **`none` is sent as is**, it is not the same as no Reasoning Effort node (which lets the model use its default): on vLLM, SGLang and llama.cpp, it disables thinking for models whose chat template supports it.
 - **Extra Body keys override** the ones of the previous option nodes. A `null` value for an option key (e.g. `{"seed": null}`) removes that option from the request.
 - **Chat template options** go through Extra Body. The chat template is the model specific format the server turns the messages into; some have switches, e.g. `{"chat_template_kwargs": {"enable_thinking": false}}` disables the thinking of Qwen3 models.
+
+### Build History
+
+Adds a message to a conversation history without calling any server: start a new history, or add to the one received. Chain several of these nodes to write a conversation by hand, e.g. examples for the model to follow, or an image shown in an earlier turn.
+
+| Input | Default | Description |
+|---|---|---|
+| `History` | | Optional: the history to add the message to. Without it, a new history holding only this message |
+| `Role` | `user` | `user`, `assistant`, `system` or `developer`. Picking `user` shows the `Image(s)` input |
+| `Text` | | The message text, required |
+| `Image(s)` (`user` role only) | | Optional: an image or a batch of images, sent before the text |
+
+| Output | Description |
+|---|---|
+| `History` | The history received, plus the new message |
+
+- **Example**: Build History (`user`: "Translate to French: cat") -> Build History (`assistant`: "chat") -> Chat Completion (`History` input, `Prompt`: "Translate to French: dog"). The model sees the first exchange as the way to answer.
+- **Where the message goes**: at the end of the history, except a `system` or `developer` message, which becomes the **first** message and replaces the existing system/developer one, if any. A non empty `System Prompt` on the Chat Completion still replaces it (see [System prompt and history](#chat-completion)).
+- **Images** are for `user` messages: the `Image(s)` input is only shown while the role is `user`, and an image left connected to it is ignored once another role is picked. They are encoded like the ones of Chat Completion (PNG) and need a vision capable model. Trim History counts them in its `Max Images`.
+- **End with an answer**: a Chat Completion adds its own user message after the history, and servers expect the roles to alternate. End the built history with an `assistant` message (or only a system one).
 
 ### Trim History
 

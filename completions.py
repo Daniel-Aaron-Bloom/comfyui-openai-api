@@ -361,7 +361,7 @@ def _split_options(options: OptionsPayload | None) -> _RequestOptions:
     return _RequestOptions(fields, extra_body, instructions_role)
 
 
-def _instructions_message(content: str, developer: bool) -> ChatCompletionMessageParam:
+def instructions_message(content: str, developer: bool) -> ChatCompletionMessageParam:
     # Two literals: the message types need a literal role
     if developer:
         return {"role": "developer", "content": content}
@@ -378,7 +378,7 @@ def _build_messages(history: HistoryPayload | None, system_prompt: str | None,
     has_instructions = bool(messages) and messages[0].get("role") in INSTRUCTIONS_ROLES
     role = options.instructions_role
     if system_prompt:
-        instructions = _instructions_message(system_prompt, role == "developer")
+        instructions = instructions_message(system_prompt, role == "developer")
         if has_instructions:
             messages[0] = instructions
         else:
@@ -414,7 +414,7 @@ def _without_reasoning(messages: list[ChatCompletionMessageParam]) -> list[ChatC
     return stripped
 
 
-def _user_message(prompt: str, image_urls: list[str] | None) -> ChatCompletionMessageParam:
+def user_message(prompt: str, image_urls: list[str] | None) -> ChatCompletionMessageParam:
     if image_urls is None:
         return {"role": "user", "content": prompt}
     # Multi modal content: every image of the batch, then the prompt once (it
@@ -577,7 +577,7 @@ class ChatCompletion(io.ComfyNode):
             )
         image_urls = await encode_images(images) if images is not None else None
         messages = _build_messages(history, system_prompt, request_options)
-        messages.append(_user_message(prompt, image_urls))
+        messages.append(user_message(prompt, image_urls))
         request_kwargs: dict[str, Any] = {
             "model": model,
             # None: a linked value with nothing stored, the default applies
