@@ -1,6 +1,9 @@
+import os
+import ssl
+from typing import Any
 from urllib.parse import urlparse
 
-from openai import AsyncOpenAI, OpenAIError
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient, OpenAIError
 from comfy_api.latest import io
 
 from . import aioloop
@@ -18,8 +21,9 @@ from .iotypes import ParamClient, check_input
 
 logger = get_logger(__name__)
 
-# Base URLs already warned about, to log the missing prefix warning only once
+# Base URLs already warned about, to log each warning only once
 _warned_base_urls: set[str] = set()
+_warned_unverified_base_urls: set[str] = set()
 
 
 def clean_api_key(api_key: str) -> str:
@@ -61,9 +65,90 @@ def check_base_url(base_url: str) -> str | None:
     return None
 
 
-async def _build_client(base_url: str, max_retries: int, timeout: int) -> AsyncOpenAI:
+def is_pem_text(ca_cert: str) -> bool:
+    """Whether the CA Certificate input holds the PEM text itself (pasted)
+    instead of the path of a file."""
+    return "-----BEGIN " in ca_cert
+
+
+def clean_ca_cert_path(ca_cert: str) -> str:
+    """The path typed in the CA Certificate input: without the surrounding
+    spaces or quotes (Windows "Copy as path" adds them), with ~ expanded.
+    Empty when there is none."""
+    path = ca_cert.strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in "\"'":
+        path = path[1:-1].strip()
+    return os.path.expanduser(path)
+
+
+def has_ca_cert(ca_cert: str) -> bool:
+    """Whether the CA Certificate input holds anything (empty quotes are not)."""
+    return is_pem_text(ca_cert) or clean_ca_cert_path(ca_cert) != ""
+
+
+def load_ssl_context(ca_cert: str) -> ssl.SSLContext:
+    """An SSL context trusting only the certificates of the CA Certificate
+    input, a PEM text or the path of a PEM file (the self-signed server
+    certificate itself, or the CA that signed it): the default trusted ones
+    are replaced, as with curl --cacert. Raises a ValueError with a clear
+    message when it is unusable."""
+    if is_pem_text(ca_cert):
+        # A private key pasted along (or instead): it would be saved in the
+        # workflow and in the metadata of generated images, like an API key
+        if "PRIVATE KEY-----" in ca_cert:
+            raise ValueError(
+                "the CA Certificate holds a private key: never paste one, it would be saved in the "
+                "workflow and in the metadata of generated images. Only the public certificate is needed")
+        # Pasted text often carries indentation or Windows line endings
+        pem = "\n".join(line.strip() for line in ca_cert.strip().splitlines()) + "\n"
+        try:
+            return ssl.create_default_context(cadata=pem)
+        except ssl.SSLError as e:
+            raise ValueError(f"the pasted CA Certificate is not a valid PEM certificate ({e.reason or e})") from None
+    path = clean_ca_cert_path(ca_cert)
+    try:
+        return ssl.create_default_context(cafile=path)
+    except FileNotFoundError:
+        raise ValueError(
+            f"the CA Certificate file {path} does not exist (the path is read on the machine running ComfyUI)") from None
+    except ssl.SSLError as e:
+        raise ValueError(
+            f"the CA Certificate file {path} holds no valid PEM certificate ({e.reason or e})") from None
+    except OSError as e:
+        raise ValueError(f"the CA Certificate file {path} can not be read ({e.strerror or e})") from None
+
+
+def check_ca_cert(ca_cert: str) -> str | None:
+    """The error message for an unusable CA Certificate, None if valid or empty."""
+    if not has_ca_cert(ca_cert):
+        return None
+    try:
+        load_ssl_context(ca_cert)
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def build_verify(verify_ssl: bool, ca_cert: str) -> ssl.SSLContext | bool:
+    """What the HTTP client gets as `verify`: False (certificate not checked),
+    an SSL context trusting only the CA Certificate, or True (the default
+    trusted certificates)."""
+    if not verify_ssl:
+        return False
+    if not has_ca_cert(ca_cert):
+        return True
+    return load_ssl_context(ca_cert)
+
+
+async def _build_client(base_url: str, max_retries: int, timeout: int,
+                        verify: ssl.SSLContext | bool = True) -> AsyncOpenAI:
     # A coroutine only to run on the API client loop
-    options = {"base_url": base_url, "max_retries": max_retries, "timeout": timeout}
+    options: dict[str, Any] = {"base_url": base_url, "max_retries": max_retries, "timeout": timeout}
+    if verify is not True:
+        # The default HTTP client of the SDK (same limits, redirects and
+        # proxies), only with another way to check the server certificate.
+        # Left to the SDK otherwise.
+        options["http_client"] = DefaultAsyncHttpxClient(verify=verify)
     try:
         # No api_key: the SDK reads the OPENAI_API_KEY environment variable
         client = AsyncOpenAI(**options)
@@ -113,6 +198,27 @@ class Client(io.ComfyNode):
                     max=86400,  # explicit, otherwise the frontend caps it at 2048
                     advanced=True,
                 ),
+                # Optional: workflows and API prompts saved before these inputs
+                # existed have no value for them (a missing required input is
+                # a validation error), the defaults of execute apply
+                io.Boolean.Input(
+                    id="verify_ssl",
+                    display_name="Verify SSL",
+                    tooltip="Check the certificate of an https:// server (the default, keep it on). Turn it off to accept any certificate (self-signed, expired, wrong host name): the connection stays encrypted, but the server is no longer authenticated, so anything able to intercept it could read your requests and your API key. Prefer CA Certificate for a self-signed server. Has no effect on http:// URLs.",
+                    default=True,
+                    optional=True,
+                    advanced=True,
+                ),
+                io.String.Input(
+                    id="ca_cert",
+                    display_name="CA Certificate",
+                    tooltip="The certificate to trust for an https:// server: either the path of a PEM file on the machine running ComfyUI, or the PEM text itself (-----BEGIN CERTIFICATE----- ...) pasted here. Give the self-signed certificate itself, or the certificate of the (private) CA that signed it, never a private key. It replaces the default trusted certificates and must list the host name or IP address of the Base URL. Empty: use the default trusted certificates. Ignored when Verify SSL is off.",
+                    placeholder="Path of a PEM file, or the PEM certificate itself",
+                    multiline=True,
+                    default="",
+                    optional=True,
+                    advanced=True,
+                ),
             ],
             outputs=[
                 ParamClient.Output(
@@ -124,14 +230,37 @@ class Client(io.ComfyNode):
         )
 
     @classmethod
-    def validate_inputs(cls, base_url: str | None) -> bool | str:
+    def validate_inputs(cls, base_url: str | None, verify_ssl: bool | None = True,
+                        ca_cert: str | None = "") -> bool | str:
         # None when coming from another node: checked at execution
-        if base_url is None:
-            return True
-        return check_base_url(base_url) or True
+        if base_url is not None:
+            error = check_base_url(base_url)
+            if error is not None:
+                return error
+        # Not read when the certificate check is off
+        if verify_ssl is not False and ca_cert is not None:
+            error = check_ca_cert(ca_cert)
+            if error is not None:
+                return error
+        return True
 
     @classmethod
-    async def execute(cls, base_url: str, max_retries: int, timeout: int) -> io.NodeOutput:
+    def fingerprint_inputs(cls, ca_cert: str | None = "", **kwargs) -> str:
+        # A certificate file is read when the node runs, its content is not an
+        # input: a replaced file (a renewed certificate, same path) must
+        # rebuild the cached client, whose connections trust the old one.
+        # A pasted PEM is an input itself.
+        if not isinstance(ca_cert, str) or ca_cert.strip() == "" or is_pem_text(ca_cert):
+            return ""
+        try:
+            stat = os.stat(clean_ca_cert_path(ca_cert))
+        except OSError:
+            return ""
+        return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+    @classmethod
+    async def execute(cls, base_url: str, max_retries: int, timeout: int,
+                      verify_ssl: bool = True, ca_cert: str = "") -> io.NodeOutput:
         # A linked Base URL is not checked by validate_inputs (None there)
         if not isinstance(base_url, str) or base_url.strip() == "":
             raise ValueError(
@@ -143,6 +272,8 @@ class Client(io.ComfyNode):
         # Linked numbers: a None timeout would mean no timeout at all
         check_input(max_retries, int, "Max Retries", "a whole number", "Client", optional=False)
         check_input(timeout, (int, float), "Timeout", "a number", "Client", optional=False)
+        check_input(verify_ssl, bool, "Verify SSL", "true or false", "Client", optional=False)
+        check_input(ca_cert, str, "CA Certificate", "a path or a PEM text", "Client", optional=False)
         error = check_base_url(base_url)
         if error is not None:
             raise ValueError(f"Client: {error}")
@@ -157,6 +288,16 @@ class Client(io.ComfyNode):
         # reused across prompts while ComfyUI caches it: its connections are
         # kept alive between requests. Built and used on the API client loop
         # only (see aioloop), never on the per prompt ComfyUI one.
-        client = await aioloop.submit(_build_client(base_url, max_retries, timeout))
+        try:
+            verify = build_verify(verify_ssl, ca_cert)
+        except ValueError as e:
+            raise ValueError(f"Client: {e}") from None
+        if verify is False and urlparse(base_url).scheme == "https" and base_url not in _warned_unverified_base_urls:
+            _warned_unverified_base_urls.add(base_url)
+            logger.warning(
+                "Client: the SSL certificate of %s is not verified (Verify SSL is off): anything able to "
+                "intercept the connection can read the requests, including the API key. For a self-signed "
+                "server, the CA Certificate input is safer", base_url)
+        client = await aioloop.submit(_build_client(base_url, max_retries, timeout, verify))
         aioloop.close_when_collected(client)
         return io.NodeOutput(client)

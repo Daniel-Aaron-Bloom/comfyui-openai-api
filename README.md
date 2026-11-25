@@ -63,11 +63,24 @@ Every node name starts with `OpenAI API - `, and they are all in the `OpenAI API
 | `Base URL` | `https://api.openai.com/v1` | The server API, **including its path prefix** (usually `/v1`) |
 | `Max Retries` (advanced) | 2 | Retries of a failed request (connection error, timeout, HTTP 408/409/429/5xx), with an exponential backoff. 0 to 10 |
 | `Timeout` (advanced) | 600 | Maximum duration of a request attempt, in seconds. Raise it for slow local models writing long answers |
+| `Verify SSL` (advanced) | on | Checks the certificate of an `https://` server. Turn it off only as a last resort, see [HTTPS with a self-signed certificate](#https-with-a-self-signed-certificate) |
+| `CA Certificate` (advanced) | empty | The certificate to trust for an `https://` server: the path of a PEM file, or the PEM text pasted in the field. For servers with a self-signed or private CA certificate |
 
 - **The Base URL is the part before `/chat/completions`**: requests go to `<Base URL>/chat/completions`, nothing is added automatically. Surrounding spaces and a trailing slash make no difference.
 - **Common Base URLs**: `http://localhost:8000/v1` (vLLM, SGLang, tabbyAPI...), `http://localhost:11434/v1` (Ollama), `http://localhost:1234/v1` (LM Studio), `https://api.openai.com/v1`. Some providers use another prefix; llama.cpp also answers without `/v1` (e.g. `http://localhost:8080`).
 - **`localhost` is the machine running ComfyUI**: with ComfyUI in Docker or the server on another computer, use the server IP address (or `host.docker.internal` from a container).
 - **One client for many nodes**: connect it to as many Chat Completion and Unload Model nodes as needed. They share its connections to the server, kept open between requests and across runs (as long as ComfyUI keeps the Client node cached).
+
+#### HTTPS with a self-signed certificate
+
+A server with its own certificate (a self-signed one, or one from a private CA) is refused by default, with a `CERTIFICATE_VERIFY_FAILED` or `certificate is not trusted` error. Two ways to fix it, the first one being the safe one:
+
+1. **Trust that certificate** (recommended): fill `CA Certificate` with the public certificate of the server (the self-signed one itself, or the CA that signed it), either as the **path of a PEM file** on the machine running ComfyUI (`~`, spaces and quotes around the path are handled) or as the **PEM text itself**, pasted in the field (`-----BEGIN CERTIFICATE----- ...`, several certificates can follow each other). The connection stays fully verified, against that certificate only: it **replaces** the default trusted certificates, as `curl --cacert` does. The certificate must list the host name or IP address of the `Base URL` in its *Subject Alternative Name*, a certificate with only a common name (CN) is refused even when trusted.
+2. **Turn `Verify SSL` off**: nothing is checked anymore, the server can be anyone. The traffic is still encrypted, but whoever sits on the network path can impersonate the server and read your requests and your `OPENAI_API_KEY`. Acceptable on a trusted home network, a bad idea anywhere else. The console warns once per URL. `CA Certificate` is ignored when it is off.
+
+- **Only the public certificate**: never paste a private key (`...PRIVATE KEY...`), the node refuses it. A pasted certificate is saved in the workflow and the metadata of generated images like any other widget value, which is harmless for a public certificate but reveals which server you use.
+- **A certificate file is read when the node runs**: replacing its content (a renewed certificate) rebuilds the cached client at the next run.
+- **`http://` URLs** are not affected by these two inputs.
 
 ### Chat Completion
 
@@ -268,6 +281,7 @@ If you used a version older than 3.0.0 with a real key and shared generated imag
 ## Troubleshooting
 
 - **Connection error or timeout**: check that the server is running and that the `Base URL` reaches it from the machine running ComfyUI (`localhost` is that machine, see [Client](#client)).
+- **`CERTIFICATE_VERIFY_FAILED`, `certificate is not trusted`** or a certificate/host name mismatch on an `https://` URL: the server uses a self-signed or private CA certificate, see [HTTPS with a self-signed certificate](#https-with-a-self-signed-certificate).
 - **HTTP 404**: a model name the server does not know, or a `Base URL` without its API prefix (usually `/v1`; a Base URL without any path triggers a warning in the console).
 - **HTTP 401**: the server needs an API key, see [API key](#api-key). Free cloud models (e.g. OpenRouter `:free` ones) need one too.
 - **HTTP 400 or 422 on the second turn, mentioning `reasoning`**: the server rejects the reasoning sent back. Turn `Send Back Reasoning` off.

@@ -1,5 +1,6 @@
 import contextlib
 import re
+import ssl
 from typing import Any
 from urllib.parse import urlparse
 
@@ -91,13 +92,15 @@ def _response_body_snippet(response: Any, max_len: int = 300) -> str:
 def _connection_error_reason(err: BaseException) -> BaseException:
     """The most telling cause of a connection error. The async HTTP client
     wraps the OS error (e.g. "[Errno 111] Connect call failed") in generic
-    ones ("All connection attempts failed"): prefer it when there is one."""
+    ones ("All connection attempts failed"): prefer it when there is one. An
+    SSL error is one too, whether it has an errno or not (the system trust
+    store used by recent SDK versions raises certificate errors without)."""
     first = err.__cause__ or err.__context__ or err
     seen: set[int] = set()
     current: BaseException | None = first
     while current is not None and id(current) not in seen:
         seen.add(id(current))
-        if isinstance(current, OSError) and current.errno is not None:
+        if isinstance(current, OSError) and (current.errno is not None or isinstance(current, ssl.SSLError)):
             return current
         current = current.__cause__ or current.__context__
     return first
@@ -140,5 +143,11 @@ def describe_api_error(err: Exception, client: AsyncOpenAI, hints: dict[int, str
         reason = _connection_error_reason(err)
         kind = "timed out" if isinstance(err, openai.APITimeoutError) else "failed"
         detail = f"{type(reason).__name__}: {reason}" if str(reason) else type(reason).__name__
-        return redact(f"cannot reach {client.base_url}: the connection {kind} ({detail})", client)
+        message = f"cannot reach {client.base_url}: the connection {kind} ({detail})"
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            message += (". Hint: the server certificate is not trusted. For a self-signed (or private CA) "
+                        "certificate, set the CA Certificate advanced input of the Client node (a PEM file path, or the "
+                        "PEM text), which must list the host name or IP address of the Base URL. Turning Verify SSL off "
+                        "skips the check, which is unsafe on an untrusted network")
+        return redact(message, client)
     return redact(str(err), client)
