@@ -1,6 +1,10 @@
 // The Memory panel: a sidebar tab to view, edit and save back the values the
 // Save Memory nodes store (a conversation history, a text), without going
 // through a workflow. The HTTP routes it talks to are in routes.py.
+//
+// The memory is split in sessions, one per browser tab: the panel shows the
+// one of its tab (the client id of the page, what its workflows are queued
+// with) and the memory shared by all of them.
 
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
@@ -8,6 +12,11 @@ import { api } from "../../scripts/api.js";
 const TAB_ID = "openai-api-memory";
 const PATH = "/openai_api/memory";
 const ROLES = ["system", "developer", "user", "assistant"];
+// Where a key lives, in the order of the list
+const SCOPES = [
+    { id: "session", title: "This session", help: "Private to this browser tab, for the Save Memory nodes where Shared is off." },
+    { id: "shared", title: "Shared by all sessions", help: "For the Save Memory nodes where Shared is on, and the workflows queued without client id (scripts calling the API)." },
+];
 // The events telling that a run may have stored something (a Save Memory
 // node). The first ones only reach the page that queued the prompt: the queue
 // status is broadcast, so it also covers the runs queued by another tab or
@@ -20,7 +29,7 @@ const state = {
     entries: null,   // the keys holding a value, null before the first load
     listError: null,
     // The key being edited, null in the list of keys:
-    //   { key, kind, version, original (JSON text), draft, status, newerVersion, saving }
+    //   { scope, key, kind, version, original (JSON text), draft, status, newerVersion, saving }
     edit: null,
 };
 let mounted = null;      // { root, body, toolbar } of the open tab, null when closed
@@ -66,6 +75,9 @@ async function request(path, options) {
     return { ok: response.ok, status: response.status, data };
 }
 
+// The client id of this page: its session. Unknown until its socket connects.
+const clientId = () => api.clientId ?? "";
+
 function errorText(result) {
     return result.data?.error || `The server answered HTTP ${result.status}`;
 }
@@ -93,6 +105,8 @@ const STYLE = `
 .oaim-banner { padding: 6px 8px; border-radius: 4px; border: 1px solid #d9a21b; background: rgba(217,162,27,.15);
   display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .oaim-banner span { flex: 1 1 14em; }
+.oaim-group { margin-top: 4px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--descrip-text, #999); }
 .oaim-list { display: flex; flex-direction: column; gap: 6px; }
 .oaim-row { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; text-align: left; width: 100%;
   padding: 6px 8px; border-radius: 4px; border: 1px solid var(--border-color, #555);
@@ -403,7 +417,7 @@ function updateBar() {
     if (e.newerVersion != null) {
         banner.append(
             h("span", {}, "This key was saved again since you opened it (a workflow run, or another tab). Reload to see the new value (your edits are dropped), or save yours over it."),
-            button("Reload", "Load the current value, dropping your edits", () => openKey(e.key, true)),
+            button("Reload", "Load the current value, dropping your edits", () => openKey(e.scope, e.key, true)),
             button("Save anyway", "Overwrite the current value with yours", () => save_(true), { disabled: !dirty || invalid.size > 0 }));
     }
     banner.hidden = e.newerVersion == null;
@@ -421,7 +435,7 @@ async function save_(overwrite = false) {
     try {
         result = await request(`${PATH}/value`, {
             method: "PUT", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ key: e.key, version: e.version, value: e.draft }),
+            body: JSON.stringify({ scope: e.scope, client_id: clientId(), key: e.key, version: e.version, value: e.draft }),
         });
     } catch (error) {
         result = { ok: false, status: 0, data: { error: `The server can not be reached (${error.message})` } };
@@ -489,7 +503,8 @@ function drawEditor(root) {
     root.append(
         h("div", { class: "oaim-bar" },
             button("←", "Back to the list of keys", leaveEditor, { class: "oaim-btn oaim-icon" }),
-            h("div", { class: "oaim-title", title: e.key }, "Key ", h("code", {}, e.key)),
+            h("div", { class: "oaim-title", title: `${e.key} (${scopeOf(e.scope).title.toLowerCase()})` },
+                "Key ", h("code", {}, e.key), h("span", { class: "oaim-kind" }, e.scope)),
             bar.revert, bar.save, bar.status),
         bar.banner,
         content,
@@ -502,11 +517,11 @@ function drawEditor(root) {
     redrawBody();
 }
 
-async function openKey(key, force = false) {  // force: reload the key being edited
+async function openKey(scope, key, force = false) {  // force: reload the key being edited
     if (force && state.edit && isDirty(state.edit) && !confirm("Discard your unsaved edits and load the current value?")) return;
     let result;
     try {
-        result = await request(`${PATH}/value?${new URLSearchParams({ key })}`);
+        result = await request(`${PATH}/value?${new URLSearchParams({ scope, client_id: clientId(), key })}`);
     } catch (error) {
         result = { ok: false, status: 0, data: { error: `The server can not be reached (${error.message})` } };
     }
@@ -519,11 +534,23 @@ async function openKey(key, force = false) {  // force: reload the key being edi
     }
     const { version, kind, value } = result.data;
     const original = JSON.stringify(value);
-    state.edit = { key, kind, version, original, draft: JSON.parse(original), status: null, newerVersion: null, saving: false };
+    state.edit = { scope, key, kind, version, original, draft: JSON.parse(original), status: null, newerVersion: null, saving: false };
     redraw();
 }
 
 // ---- the list of keys ------------------------------------------------------
+
+const scopeOf = (id) => SCOPES.find((scope) => scope.id === id) ?? SCOPES[0];
+
+function keyRow(entry) {
+    const editable = entry.kind !== "other";
+    return h("button", {
+        type: "button", class: "oaim-row", disabled: !editable,
+        title: editable ? "View and edit this value" : "Only histories and texts can be edited",
+        onclick: () => openKey(entry.scope, entry.key),
+    }, h("span", { class: "oaim-key" }, entry.key, h("span", { class: "oaim-kind" }, entry.kind)),
+    h("span", { class: "oaim-sum" }, entry.summary));
+}
 
 function drawList(root) {
     root.append(
@@ -531,31 +558,29 @@ function drawList(root) {
             h("div", { class: "oaim-title" }, "Memory"),
             button("↻", "Refresh the list", () => refreshList(), { class: "oaim-btn oaim-icon" })),
         h("p", { class: "oaim-help" },
-            "The values stored by the Save Memory nodes, kept in RAM until ComfyUI restarts. Pick a history or a text to view and edit it: the next run of a Load Memory node on that key gets what you save."));
+            "The values stored by the Save Memory nodes, kept in RAM until ComfyUI restarts. Each browser tab has its own memory, and only sees its own: pick a history or a text to view and edit it, and the next run of a Load Memory node on that key, from this tab, gets what you save."));
     if (state.listError) root.append(h("div", { class: "oaim-banner" }, h("span", {}, state.listError)));
     if (state.entries === null) {
         root.append(h("p", { class: "oaim-help" }, "Loading..."));
         return;
     }
     if (!state.entries.length) {
-        root.append(h("p", { class: "oaim-help" }, "Nothing is stored yet. Run a workflow with a Save Memory node, then refresh."));
+        root.append(h("p", { class: "oaim-help" }, "Nothing is stored for this session yet. Run a workflow with a Save Memory node from this tab, then refresh."));
         return;
     }
-    root.append(h("div", { class: "oaim-list" }, state.entries.map((entry) => {
-        const editable = entry.kind !== "other";
-        return h("button", {
-            type: "button", class: "oaim-row", disabled: !editable,
-            title: editable ? "View and edit this value" : "Only histories and texts can be edited",
-            onclick: () => openKey(entry.key),
-        }, h("span", { class: "oaim-key" }, entry.key, h("span", { class: "oaim-kind" }, entry.kind)),
-        h("span", { class: "oaim-sum" }, entry.summary));
-    })));
+    for (const scope of SCOPES) {
+        const entries = state.entries.filter((entry) => entry.scope === scope.id);
+        if (!entries.length) continue;
+        root.append(
+            h("div", { class: "oaim-group", title: scope.help }, scope.title),
+            h("div", { class: "oaim-list" }, entries.map(keyRow)));
+    }
 }
 
 async function refreshList() {
     let result;
     try {
-        result = await request(PATH);
+        result = await request(`${PATH}?${new URLSearchParams({ client_id: clientId() })}`);
     } catch (error) {
         result = { ok: false, status: 0, data: { error: `The server can not be reached (${error.message})` } };
     }
@@ -565,7 +590,7 @@ async function refreshList() {
         const e = state.edit;
         if (e) {
             // Changed by a run (or wiped) while open: warn before the save does
-            const entry = state.entries.find((x) => x.key === e.key);
+            const entry = state.entries.find((x) => x.scope === e.scope && x.key === e.key);
             e.newerVersion = entry && entry.version !== e.version ? entry.version : e.newerVersion;
             if (!entry && !e.saving) {
                 e.status = { text: "Nothing is stored under this key anymore (reset?). Saving is refused.", bad: true };

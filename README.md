@@ -172,24 +172,36 @@ Carry a value from one queued run to the next: an answer, an image analysis, a w
 |---|---|---|---|
 | Save Memory | `Key` | `memory` | The name the value is stored under |
 | | `Value` | | Any value: a copy is stored, and the value is passed through |
+| | `Shared` | off | Advanced: share the key with every session instead of keeping it private to yours (see [Sessions](#sessions)) |
 | Load Memory | `Key` | `memory` | The name to read |
 | | `Reset` | off | Wipes the key and returns nothing (or `Default`) for this run |
+| | `Shared` | off | Advanced: must match the Save Memory node |
 | | `Default` | | Optional: returned when nothing is stored |
 
 - **Load Memory returns nothing** (`None`, as if the input was not connected) when the key is empty or nothing is stored yet, e.g. on the first run. A stored `None` counts as nothing stored. Connect `Default` to return a value instead: needed when the output goes into a required input, like a text concatenation.
 - **`Reset`**: **untick it afterwards**, otherwise the key is wiped on every run.
 - **Save Memory always runs**, on every queued prompt, even with nothing connected downstream.
-- **RAM only**: the memory is a helper, not a database. It is shared by every prompt and workflow using the same key, and lost when ComfyUI restarts.
+- **RAM only**: the memory is a helper, not a database. It is lost when ComfyUI restarts.
+- **Per session**: unless `Shared` is on, a key is private to the browser tab that queued the run (see below), and shared by every workflow of that tab using the same key.
+
+#### Sessions
+
+Two people (or two tabs) running a loop with the default `memory` key do not meet: the memory is split in **sessions**, one per browser tab. A session is the client id ComfyUI gives the tab, and it is kept when the tab is reloaded. A new tab is a new session, with an empty memory.
+
+- **`Shared` on**: the key lives in the memory shared by every session instead, for a value one workflow must hand to another tab. Save Memory and Load Memory must agree, like they do for the key.
+- **No browser, no session**: a prompt queued without a client id (a script calling the API directly) has no session, and always uses the shared memory, whatever `Shared` says. A script that wants a private memory can send a `client_id` of its own with its prompts.
+- **At most 32 sessions** hold values at once, as every tab opened over the days is a new one: the memory of the least recently used one is dropped (with a console warning) when another comes in. The shared memory is never dropped.
+- **Upgrading**: before sessions the memory was shared by everything. A workflow keeps working as long as it is queued from the same tab, and the examples need no change. Turn `Shared` on, on both nodes, to get the former behavior.
 
 #### Memory panel
 
-The **Memory** tab of the ComfyUI sidebar (the database icon) lists what the Save Memory nodes stored, and lets you **view, edit and save back** a conversation history or a text, without touching the workflow: fix a wrong answer, delete a turn, rewrite the system message or a saved analysis... The next run of a Load Memory node on that key gets what you saved.
+The **Memory** tab of the ComfyUI sidebar (the database icon) lists what the Save Memory nodes stored for **your session** and in the **shared** memory, and lets you **view, edit and save back** a conversation history or a text, without touching the workflow: fix a wrong answer, delete a turn, rewrite the system message or a saved analysis... The next run of a Load Memory node on that key gets what you saved.
 
 - **A history** is one card per message: change its role, edit its text, move it, delete it, or insert a message between two others (the `+` lines). Images are shown and can be removed, not added. The reasoning of the answers is in a closed *Reasoning* section of the message, and any other field the message holds in a closed *Other fields* one.
 - **A text** is edited as is. Any other value (an image, a number...) is listed but can not be edited.
 - **Nothing changes until you click Save.** *Revert* drops your edits, and they are kept if you close the tab or open another one.
 - **Runs and edits never overwrite each other silently**: when a run saves the key you are editing, the panel tells you and offers *Reload* (drops your edits) or *Save anyway*. A save made on an outdated value is refused.
-- **Open to whoever opens ComfyUI**: anyone who can reach it can read and edit the memory this way, as they can already run the workflows that load it.
+- **Your session and the shared memory only**: a tab does not list, nor can it read, the memory of another session. This is no authentication though: the client id of a tab is only a secret nobody else is told, and anyone who can reach ComfyUI can read and edit the shared memory, as they can already run the workflows that load it.
 
 ### Unload Model
 
